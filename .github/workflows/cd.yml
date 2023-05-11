@@ -1,0 +1,121 @@
+# Continuous Deploy
+#
+# 브랜치별로 매핑된 환경에 빌드 및 배포를 진행합니다.
+name: Continuous Deploy
+
+on:
+  push:
+    branches:
+      - master
+      - stage
+      - develop
+    paths:
+      - 'environments/**'
+      - 'public/**'
+      - 'src/**'
+      - '.github/workflows/cd.yml'
+      - 'craco.config.js'
+      - 'package.json'
+      - 'tsconfig*.json'
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    environment: ${{ fromJSON(vars.MAPPED_BRANCH_ENV)[github.ref_name] || 'dev' }}
+    outputs:
+      ENVIRONMENT: ${{ steps.vars.outputs.ENVIRONMENT }}
+      HEAD_COMMIT_MESSAGE: ${{ steps.vars.outputs.HEAD_COMMIT_MESSAGE }}
+      COMMITS: ${{ steps.vars.outputs.COMMITS }}
+      BY: ${{ steps.vars.outputs.BY }}
+      SLACK_TS: ${{ steps.slack.outputs.ts }}
+
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          # 최근 커밋 로그를 가져오기 위한 depth 설정입니다.
+          fetch-depth: 0
+
+      - name: Set variables
+        id: vars
+        run: |
+          echo "ENVIRONMENT=${{ fromJSON(vars.MAPPED_BRANCH_ENV)[github.ref_name] || 'dev' }}" >> $GITHUB_OUTPUT
+
+          HEAD_COMMIT=$(git log -1 --format=%s --no-merges ${{ github.event.before}}..${{ github.event.after }})
+          echo "HEAD_COMMIT_MESSAGE=$HEAD_COMMIT" >> $GITHUB_OUTPUT
+
+          COMMITS=$(cat << EOF
+          $(git log -10 --format="\n> \`%h\` %s" --no-merges ${{ github.event.before}}..${{ github.event.after }} | sed -e 's/*//g')
+          EOF
+          )
+          echo COMMITS=$COMMITS >> $GITHUB_OUTPUT
+
+          echo "BY=${{ fromJson(vars.MEMBER_SLACK_IDS)[github.event.sender.login] }}" >> $GITHUB_OUTPUT
+
+  deployment:
+    runs-on: ubuntu-latest
+    environment: ${{ fromJSON(vars.MAPPED_BRANCH_ENV)[github.ref_name] || 'dev' }}
+    strategy:
+      matrix:
+        node: [16.x]
+    needs: prepare
+    steps:
+      - uses: actions/checkout@v3
+
+      # Create Deployment
+      - name: Create GitHub deployment
+        uses: chrnorm/deployment-action@v2
+        id: deployment
+        with:
+          token: '${{ secrets.GITHUB_TOKEN }}'
+          environment-url: ${{ vars.APP_BASE_URL }}
+          environment: ${{ needs.prepare.outputs.ENVIRONMENT }}
+
+      - name: Use Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v3
+        with:
+          always-auth: true
+          node-version: ${{ matrix.node }}
+          registry-url: https://registry.npmjs.org
+
+      - name: Get yarn cache directory
+        if: vars.USE_CACHE_YN == 'Y'
+        id: yarn-cache-dir-path
+        run: echo dir=$(yarn cache dir) >> $GITHUB_OUTPUT
+
+      - name: Cache dependencies
+        if: vars.USE_CACHE_YN == 'Y'
+        uses: actions/cache@v3
+        id: yarn-cache
+        with:
+          path: |
+            ${{ steps.yarn-cache-dir-path.outputs.dir }}
+            node_modules
+          key: ${{ runner.os }}-dependencies-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-dependencies-
+            ${{ runner.os }}-
+
+      - name: Show yarn cache directory
+        run: echo "yarn cache directory is ${{ steps.yarn-cache-dir-path.outputs.dir }}"
+
+      - name: Install dependencies
+        if: |
+          vars.USE_CACHE_YN != 'Y' ||
+          steps.yarn-cache.outputs.cache-hit != 'true'
+        run: yarn install --frozen-lockfile
+
+      - name: Build
+        run: |
+          echo "::group::Run build"
+          if [ ${{ needs.prepare.outputs.ENVIRONMENT }} == "prod" ]; then
+            yarn run build
+          elif [ ${{ needs.prepare.outputs.ENVIRONMENT }} == "stage" ]; then
+            yarn run build:stage
+          elif [ ${{ needs.prepare.outputs.ENVIRONMENT }} == "canary" ]; then
+            yarn run build:canary
+          else
+            yarn run build:develop
+          fi
+          echo "::endgroup::"
+
+      
