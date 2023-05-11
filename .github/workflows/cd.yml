@@ -9,6 +9,7 @@ on:
       - master
       - stage
       - develop
+      - feature/FE-1850
     paths:
       - 'environments/**'
       - 'public/**'
